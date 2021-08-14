@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"log"
 	"net"
 	"net/http"
 	"strconv"
@@ -22,9 +24,15 @@ func genLogin(user Addr, pass int) string {
 
 func readLine(conn net.Conn, d time.Duration) (string, error) {
 	if d > 0 {
-		conn.SetReadDeadline(time.Now().Add(d))
+		err := conn.SetReadDeadline(time.Now().Add(d))
+		if err != nil {
+			return "", err
+		}
 	} else {
-		conn.SetReadDeadline(time.Time{})
+		err := conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			return "", err
+		}
 	}
 	s, err := bufio.NewReader(conn).ReadString('\n')
 	return strings.TrimSpace(s), err
@@ -128,7 +136,7 @@ func RecvIS(ctx context.Context, dial string, user Addr, pass int, filters ...st
 // dial string should be in the form scheme://host:port with
 // scheme being http, tcp, or udp.  This is most commonly used for
 // CWOP.
-func (f Frame) SendIS(dial string, pass int) error {
+func (f Frame) SendIS(dial string, user Addr, pass int) error {
 	// Refer to Connecting to APRS-IS:
 	// http://www.aprs-is.net/Connecting.aspx
 
@@ -139,11 +147,11 @@ func (f Frame) SendIS(dial string, pass int) error {
 
 	switch parts[0] {
 	case "http":
-		return f.SendHTTP(dial, pass)
+		return f.SendHTTP(dial, user, pass)
 	case "tcp":
-		return f.SendTCP(parts[1], pass)
+		return f.SendTCP(parts[1], user, pass)
 	case "udp":
-		return f.SendUDP(parts[1], pass)
+		return f.SendUDP(parts[1], user, pass)
 	}
 
 	return ErrProtoScheme
@@ -153,13 +161,13 @@ func (f Frame) SendIS(dial string, pass int) error {
 // HTTP protocol.  This scheme is the least efficient and requires
 // a verified connection (real callsign and passcode) but is
 // reliable and provides acknowledgement of receipt.
-func (f Frame) SendHTTP(dial string, pass int) (err error) {
+func (f Frame) SendHTTP(dial string, user Addr, pass int) (err error) {
 	if pass < 0 {
 		err = ErrCallNotVerified
 		return
 	}
 
-	data := fmt.Sprintf("%s\r\n%s", genLogin(f.Src, pass), f)
+	data := fmt.Sprintf("%s\r\n%s", genLogin(user, pass), f)
 
 	var req *http.Request
 	req, err = http.NewRequest("POST", dial, bytes.NewBufferString(data))
@@ -189,7 +197,7 @@ func (f Frame) SendHTTP(dial string, pass int) (err error) {
 // UDP protocol.  This scheme is the most efficient but requires
 // a verified connection (real callsign and passcode) and has no
 // acknowledgement of receipt.
-func (f Frame) SendUDP(dial string, pass int) (err error) {
+func (f Frame) SendUDP(dial string, user Addr, pass int) (err error) {
 	if pass < 0 {
 		err = ErrCallNotVerified
 		return
@@ -203,7 +211,7 @@ func (f Frame) SendUDP(dial string, pass int) (err error) {
 	defer conn.Close()
 
 	// Send data packet
-	_, err = fmt.Fprintf(conn, "%s\r\n%s", genLogin(f.Src, pass), f)
+	_, err = fmt.Fprintf(conn, "%s\r\n%s", genLogin(user, pass), f)
 
 	return
 }
@@ -211,7 +219,7 @@ func (f Frame) SendUDP(dial string, pass int) (err error) {
 // SendTCP sends a Frame to the specified APRS-IS host over the
 // TCP protocol.  This scheme is the oldest, most compatible, and
 // allows unverified connections.
-func (f Frame) SendTCP(dial string, pass int) (err error) {
+func (f Frame) SendTCP(dial string, user Addr, pass int) (err error) {
 	var conn net.Conn
 	conn, err = net.Dial("tcp", dial)
 	if err != nil {
@@ -220,25 +228,110 @@ func (f Frame) SendTCP(dial string, pass int) (err error) {
 	defer conn.Close()
 
 	// Read welcome banner
-	_, err = readLine(conn, 5*time.Second)
+	response, err := readLine(conn, 5*time.Second)
 	if err != nil {
 		return
 	}
+	log.Println("IN ", response)
 
 	// Login
-	_, err = fmt.Fprintf(conn, "%s\r\n", genLogin(f.Src, pass))
+	_, err = fmt.Fprintf(conn, "%s\r\n", genLogin(user, pass))
 	if err != nil {
 		return
 	}
+	log.Printf("OUT %s\r\n", genLogin(user, pass))
+
 	// # logresp CWxxxx unverified, server CWOP-7
 	// # logresp CWxxxx unverified, server THIRD
-	_, err = readLine(conn, 5*time.Second)
+	response, err = readLine(conn, 5*time.Second)
 	if err != nil {
 		return
 	}
+	log.Println("IN ", response)
 
 	// Send frame
 	_, err = fmt.Fprintf(conn, "%s\r\n", f)
+	log.Printf("OUT %s\r\n", f)
 
 	return
+}
+
+func processTcpSocket(conn net.Conn, frames chan Frame) {
+	ticker := time.NewTicker(1 * time.Second)
+
+readWriteLoop:
+	for {
+		select {
+		// Check if there are messages to send
+		case f := <-frames:
+			// Send frame
+			_, err := fmt.Fprintf(conn, "%s\r\n", f)
+			log.Printf("OUT %s\r\n", f)
+			if err != nil {
+				log.Println("Socket error (write)", err.Error())
+				break readWriteLoop
+			}
+
+		// Periodically check for data to read
+		case _ = <-ticker.C:
+			s, err := readLine(conn, 10*time.Millisecond)
+			if err != nil {
+				if err == io.EOF {
+					log.Println("Socket closed (read)", err.Error())
+					break readWriteLoop
+				} else if err, ok := err.(net.Error); ok && err.Timeout() {
+					// Under normal circumstance we will get a timeout if nothing was received
+					//log.Println(".")
+				} else {
+					log.Println("Socket error (read)", err.Error())
+					break readWriteLoop
+				}
+			}
+
+			if len(s) > 0 {
+				log.Println("IN ", s)
+			}
+		}
+	}
+}
+
+// SendTCPFromChannel sends Frames to the specified APRS-IS host over the
+// TCP protocol. The TCP socket is kept open, and reconnected on failure.
+// Frames to send are provided via a channel.
+func SendTCPFromChannel(dial string, user Addr, pass int, frames chan Frame) {
+	for {
+		conn, err := net.Dial("tcp", dial)
+		fmt.Print("connect (", dial)
+		if err != nil {
+			fmt.Println(") fail")
+		} else {
+			fmt.Println(") ok")
+			defer conn.Close()
+
+			// Read welcome banner
+			response, err := readLine(conn, 5*time.Second)
+			if err != nil {
+				return
+			}
+			log.Println("IN ", response)
+
+			// Login
+			_, err = fmt.Fprintf(conn, "%s\r\n", genLogin(user, pass))
+			if err != nil {
+				return
+			}
+			log.Printf("OUT %s\r\n", genLogin(user, pass))
+
+			// # logresp CWxxxx unverified, server CWOP-7
+			// # logresp CWxxxx unverified, server THIRD
+			response, err = readLine(conn, 5*time.Second)
+			if err != nil {
+				return
+			}
+			log.Println("IN ", response)
+
+			processTcpSocket(conn, frames)
+		}
+		time.Sleep(60 * time.Second) // TODO use https://pkg.go.dev/github.com/cenkalti/backoff/v4
+	}
 }
